@@ -1,138 +1,157 @@
 from __future__ import annotations
-"""
-交易信号机器人 - 主程序入口
 
-用法:
-    python main.py           # 立即扫描一次，然后定时循环
-    python main.py --once    # 只扫描一次后退出（调试/测试用）
 """
-import sys
+交易信号机器人 v2 — 主程序
+支持：
+  --once   单次扫描（GitHub Actions 模式）
+  无参数   持续循环运行（本地后台模式）
+"""
+
+import argparse
 import logging
-import time
+import sys
 import threading
+import time
 from datetime import datetime, timezone
 
-from config import (
-    SYMBOLS, TIMEFRAME, SCAN_INTERVAL_MINUTES,
-    MIN_SIGNAL_SCORE, ONLY_DIRECTIONAL_SIGNALS,
-)
-from market_data import fetch_klines, fetch_ticker_price, fetch_24h_change
 from analyzer import analyze
-from discord_notifier import send_signal, send_summary, send_startup_message
+from config import SCAN_INTERVAL_MINUTES, SYMBOLS
+from discord_notifier import send_signal, send_startup_message, send_summary
+from market_data import fetch_multi_tf, fetch_ticker, validate_symbol
 
-# ──────────────────────────────────────────────────────────────
-# 日志配置
-# ──────────────────────────────────────────────────────────────
+# ── 日志配置 ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler("signal_bot.log", encoding="utf-8"),
     ],
 )
-logger = logging.getLogger("main")
+logger = logging.getLogger(__name__)
 
 
-def scan_market():
-    """扫描所有币种，生成并推送信号"""
+# ── 核心扫描函数 ──────────────────────────────────────────────────────────────
+
+def scan_market() -> None:
+    """扫描所有配置的币种，分析信号并推送到 Discord"""
     scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    logger.info(f"=== 开始市场扫描 [{scan_time}] ===")
+    logger.info("═" * 55)
+    logger.info("开始市场扫描  %s", scan_time)
+    logger.info("═" * 55)
 
-    all_results = []
-
+    results = []
     for symbol in SYMBOLS:
-        logger.info(f"  → 分析 {symbol} ...")
+        try:
+            logger.info("分析 %s ...", symbol)
 
-        # 1. 获取 K 线
-        df = fetch_klines(symbol, TIMEFRAME)
-        if df is None:
-            continue
+            # 拉取多时间框架数据（同时验证币种可用性）
+            tf_data = fetch_multi_tf(symbol)
+            if tf_data is None:
+                logger.warning("⚠️  %s 数据不可用，跳过", symbol)
+                continue
 
-        # 2. 获取实时价格 & 24h 数据
-        price = fetch_ticker_price(symbol)
-        if price is None:
-            price = float(df.iloc[-1]["close"])
+            # 拉取 24h ticker
+            ticker = fetch_ticker(symbol)
+            if ticker is None:
+                logger.warning("⚠️  %s ticker 获取失败，跳过", symbol)
+                continue
 
-        stats = fetch_24h_change(symbol)
-        change_24h = stats["price_change_pct"] if stats else 0.0
+            # 综合分析
+            result = analyze(symbol, tf_data, ticker)
+            results.append(result)
 
-        # 3. 技术分析
-        result = analyze(symbol, df, price, change_24h)
-        if result is None:
-            continue
+            logger.info(
+                "  %s → %s  %d星  价格=%s  信号=%s",
+                symbol,
+                result.direction,
+                result.stars,
+                result.price,
+                "触发" if result.should_send else "未达门槛",
+            )
 
-        all_results.append(result)
+            # 达到门槛才推送单独信号卡
+            if result.should_send:
+                send_signal(result)
+                time.sleep(0.5)   # 避免频率限制
 
-        logger.info(
-            f"     {symbol}: {result.direction} (强度 {result.score}) "
-            f"价格={price:.4f} RSI={result.rsi:.1f}"
-        )
+        except Exception as exc:
+            logger.error("分析 %s 时出现异常: %s", symbol, exc, exc_info=True)
 
-        # 4. 是否推送单条信号
-        should_push = (
-            result.score >= MIN_SIGNAL_SCORE
-            and (not ONLY_DIRECTIONAL_SIGNALS or result.direction != "NEUTRAL")
-        )
-        if should_push:
-            ok = send_signal(result)
-            logger.info(f"     ✓ Discord 推送{'成功' if ok else '失败'}")
-        else:
-            logger.info(f"     · 信号强度不足或为中性，跳过推送")
+    # 汇总推送
+    if results:
+        send_summary(results, scan_time)
 
-    # 5. 发送汇总报告
-    if all_results:
-        send_summary(all_results, scan_time)
-        logger.info(f"汇总报告已发送，共分析 {len(all_results)} 个币种")
-
-    logger.info("=== 扫描完成 ===\n")
+    triggered_count = sum(1 for r in results if r.should_send)
+    logger.info("扫描完成：%d/%d 个币种触发信号（≥3星）", triggered_count, len(results))
 
 
-def _scheduler(interval_seconds: int, stop_event: threading.Event):
-    """后台定时线程：每 interval_seconds 秒执行一次 scan_market"""
-    while not stop_event.is_set():
-        stop_event.wait(interval_seconds)
-        if not stop_event.is_set():
+# ── 调度器 ────────────────────────────────────────────────────────────────────
+
+_stop_event = threading.Event()
+
+
+def _scheduler_loop() -> None:
+    interval = SCAN_INTERVAL_MINUTES * 60
+    while not _stop_event.is_set():
+        try:
             scan_market()
+        except Exception as exc:
+            logger.error("扫描异常: %s", exc, exc_info=True)
+        logger.info("下次扫描将在 %d 分钟后进行...", SCAN_INTERVAL_MINUTES)
+        _stop_event.wait(interval)
 
 
-def main():
-    once_mode = "--once" in sys.argv
+# ── 入口 ──────────────────────────────────────────────────────────────────────
 
-    logger.info("🤖 交易信号机器人启动")
-    logger.info(f"   监控币种: {', '.join(SYMBOLS)}")
-    logger.info(f"   时间周期: {TIMEFRAME.upper()}")
-    logger.info(f"   扫描间隔: {SCAN_INTERVAL_MINUTES} 分钟")
-
-    # 启动通知
-    send_startup_message()
-
-    # 立即执行一次
-    scan_market()
-
-    if once_mode:
-        logger.info("--once 模式，退出")
-        return
-
-    # 定时循环
-    interval_seconds = SCAN_INTERVAL_MINUTES * 60
-    stop_event = threading.Event()
-    t = threading.Thread(
-        target=_scheduler,
-        args=(interval_seconds, stop_event),
-        daemon=True,
+def main() -> None:
+    parser = argparse.ArgumentParser(description="加密货币交易信号机器人 v2")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="只运行一次扫描（用于 GitHub Actions）",
     )
-    t.start()
-    logger.info(f"已设置定时任务，每 {SCAN_INTERVAL_MINUTES} 分钟执行一次（Ctrl+C 停止）")
+    args = parser.parse_args()
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("收到退出信号，正在停止...")
-        stop_event.set()
-        t.join(timeout=5)
-        logger.info("机器人已停止")
+    logger.info("交易信号机器人 v2 启动")
+    logger.info("配置：%d 个币种，最低%d星触发", len(SYMBOLS), 3)
+
+    # 验证并分类币种
+    valid_symbols, skipped_symbols = [], []
+    for sym in SYMBOLS:
+        ok, _ = validate_symbol(sym)
+        if ok:
+            valid_symbols.append(sym)
+        else:
+            skipped_symbols.append(sym)
+
+    if not valid_symbols:
+        logger.error("没有可用的币种，请检查配置！")
+        sys.exit(1)
+
+    logger.info("有效币种（%d）：%s", len(valid_symbols), ", ".join(valid_symbols))
+    if skipped_symbols:
+        logger.warning("已跳过不可用币种：%s", ", ".join(skipped_symbols))
+
+    # 发送启动通知
+    send_startup_message(valid_symbols, skipped_symbols)
+
+    if args.once:
+        # GitHub Actions 模式：单次扫描
+        scan_market()
+    else:
+        # 本地持续运行模式
+        thread = threading.Thread(target=_scheduler_loop, daemon=True)
+        thread.start()
+        try:
+            while thread.is_alive():
+                thread.join(timeout=1)
+        except KeyboardInterrupt:
+            logger.info("接收到中断信号，正在停止...")
+            _stop_event.set()
+            thread.join(timeout=5)
+            logger.info("机器人已停止。")
 
 
 if __name__ == "__main__":

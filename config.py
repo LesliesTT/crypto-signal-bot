@@ -1,67 +1,59 @@
-"""
-交易信号机器人 - 配置文件
-修改此文件来自定义您的机器人行为
-"""
+from __future__ import annotations
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─────────────────────────────────────────────
-# Discord Webhook（必填）
-# 在 Discord 频道设置 → 整合 → Webhook 中获取
-# ─────────────────────────────────────────────
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE")
+# ── Discord ─────────────────────────────────────────────────────────────────
+DISCORD_WEBHOOK_URL: str = os.getenv("DISCORD_WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE")
 
-# ─────────────────────────────────────────────
-# 监控的交易对列表（Binance 格式）
-# ─────────────────────────────────────────────
-SYMBOLS = [
+# ── 监控币种 ─────────────────────────────────────────────────────────────────
+# 注意：XAGUSDT/NAS100USDT/CLUSDT 等可能仅在 Binance Futures 有效，
+#       代码会在运行时自动验证并跳过不可用的币种。
+SYMBOLS: list[str] = [
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT",
     "BNBUSDT",
+    "DOGEUSDT",
+    "XAUUSDT",
+    "XAGUSDT",
+    "HYPEUSDT",
+    "CLUSDT",
+    "MUSDT",
+    "SPCXUSDT",
+    "NAS100USDT",
 ]
 
-# ─────────────────────────────────────────────
-# K 线时间周期
-# 可选: 1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d
-# ─────────────────────────────────────────────
-TIMEFRAME = "1h"
+# ── 时间框架 ─────────────────────────────────────────────────────────────────
+TIMEFRAMES: dict[str, dict] = {
+    "1h":  {"interval": "1h",  "limit": 250},
+    "4h":  {"interval": "4h",  "limit": 200},
+    "1d":  {"interval": "1d",  "limit": 100},
+}
 
-# 每根 K 线获取数量（至少 200 根以保证指标精度）
-KLINE_LIMIT = 200
+# ── 信号设置 ─────────────────────────────────────────────────────────────────
+MIN_STAR_RATING: int = 3          # 最低星级才推送（1-5 星）
+SCAN_INTERVAL_MINUTES: int = 60   # 本地运行扫描间隔
 
-# ─────────────────────────────────────────────
-# 扫描间隔（分钟）
-# ─────────────────────────────────────────────
-SCAN_INTERVAL_MINUTES = 60
+# ── 技术指标参数 ──────────────────────────────────────────────────────────────
+EMA_SHORT: int          = 20       # EMA20
+EMA_VEGAS_FAST: int     = 144      # Vegas 通道快线
+EMA_VEGAS_SLOW: int     = 169      # Vegas 通道慢线
+RSI_PERIOD: int         = 14
+ATR_PERIOD: int         = 14
+VOLUME_MA_PERIOD: int   = 20
 
-# ─────────────────────────────────────────────
-# 技术指标参数
-# ─────────────────────────────────────────────
-MA_FAST = 20       # 快速均线周期
-MA_SLOW = 50       # 慢速均线周期
-RSI_PERIOD = 14    # RSI 周期
-RSI_OVERSOLD = 30  # RSI 超卖阈值（触发买入参考）
-RSI_OVERBOUGHT = 70 # RSI 超买阈值（触发卖出参考）
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-BOLL_PERIOD = 20   # 布林带周期
-BOLL_STD = 2.0     # 布林带标准差倍数
+# ATR 止损/止盈倍数
+ATR_SL_MULT: float = 1.5
+ATR_TP1_MULT: float = 2.0
+ATR_TP2_MULT: float = 3.5
 
-# ─────────────────────────────────────────────
-# 信号强度阈值：满足多少条件才推送
-# 范围 1-4，越高越严格（减少噪音）
-# ─────────────────────────────────────────────
-MIN_SIGNAL_SCORE = 2
+# ICT 参数
+ORDER_BLOCK_LOOKBACK: int         = 60    # Order Block 回溯K线数
+FVG_LOOKBACK: int                 = 40    # Fair Value Gap 回溯K线数
+BREAKOUT_VOLUME_MULT: float       = 1.5   # 真实突破需要成交量倍数
+LIQUIDITY_SWEEP_TOLERANCE: float  = 0.003 # 流动性扫描容忍度 0.3%
 
-# ─────────────────────────────────────────────
-# 仅推送有明确方向的信号（BUY / SELL）
-# False = 同时推送 NEUTRAL（观望）信号
-# ─────────────────────────────────────────────
-ONLY_DIRECTIONAL_SIGNALS = True
-
-# Binance API 地址（无需 Key，使用公开接口）
-BINANCE_BASE_URL = "https://api.binance.com"
+# 多时间框架对齐奖励分
+MTF_BONUS: int = 2
