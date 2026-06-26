@@ -650,16 +650,29 @@ def analyze(
 
     should_send = stars >= MIN_STAR_RATING and direction != "NEUTRAL"
 
-    # ── 入场点位 & 有效 OB/FVG 位置 ──────────────────────────────────────────
-    if direction == "BUY":
-        signal_obs  = near_bull_obs[:3]
-        signal_fvgs = active_bull_fvgs[:2]
-    elif direction == "SELL":
-        signal_obs  = near_bear_obs[:3]
-        signal_fvgs = active_bear_fvgs[:2]
-    else:
-        signal_obs  = []
-        signal_fvgs = []
+    # ── 入场点位 & 有效 OB/FVG 位置（多时间框架，标注周期）──────────────────────
+    signal_obs: list[dict] = []
+    signal_fvgs: list[dict] = []
+
+    if direction != "NEUTRAL":
+        tf_sources = [("1H", df_1h), ("4H", df_4h), ("日线", df_1d)]
+        for tf_name, df_tf in tf_sources:
+            b_obs_tf, bea_obs_tf = _find_order_blocks(df_tf, ORDER_BLOCK_LOOKBACK)
+            b_fvgs_tf, bea_fvgs_tf = _find_fvg(df_tf, FVG_LOOKBACK)
+
+            if direction == "BUY":
+                for ob in _get_near_obs(price, b_obs_tf):
+                    signal_obs.append({**ob, "tf": tf_name})
+                for fvg in _get_active_fvgs(price, b_fvgs_tf):
+                    signal_fvgs.append({**fvg, "tf": tf_name})
+            else:  # SELL
+                for ob in _get_near_obs(price, bea_obs_tf):
+                    signal_obs.append({**ob, "tf": tf_name})
+                for fvg in _get_active_fvgs(price, bea_fvgs_tf):
+                    signal_fvgs.append({**fvg, "tf": tf_name})
+
+        signal_obs  = signal_obs[:3]
+        signal_fvgs = signal_fvgs[:2]
 
     entry_price, zone_low, zone_high = _calc_entry(price, direction, signal_obs, signal_fvgs)
 

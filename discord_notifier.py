@@ -96,7 +96,8 @@ def _ob_fields(result: SignalResult) -> list[dict]:
     for i, ob in enumerate(result.signal_obs[:3], 1):
         lo = _fmt(ob["low"], sym)
         hi = _fmt(ob["high"], sym)
-        lines.append(f"OB{i}：`{lo}` — `{hi}`")
+        tf = ob.get("tf", "1H")
+        lines.append(f"`{tf}` OB{i}：`{lo}` — `{hi}`")
 
     return [{
         "name": f"{icon} {label}（订单块）",
@@ -117,7 +118,8 @@ def _fvg_fields(result: SignalResult) -> list[dict]:
     for i, fvg in enumerate(result.signal_fvgs[:2], 1):
         lo = _fmt(fvg["lower"], sym)
         hi = _fmt(fvg["upper"], sym)
-        lines.append(f"FVG{i}：`{lo}` — `{hi}`")
+        tf = fvg.get("tf", "1H")
+        lines.append(f"`{tf}` FVG{i}：`{lo}` — `{hi}`")
 
     return [{
         "name": f"{icon} {label}（价值缺口）",
@@ -150,7 +152,6 @@ def send_signal(result: SignalResult) -> bool:
     chg_emoji = "🔺" if result.change_24h >= 0 else "🔻"
     model_lines = "\n".join(result.triggered_models[:10]) or "无触发模型"
 
-    now_str = datetime.now(timezone.utc).strftime("今天%H:%M")
 
     fields: list[dict] = [
         {"name": "💰 当前价格", "value": f"`{_fmt(result.price, sym)}`",          "inline": True},
@@ -175,7 +176,7 @@ def send_signal(result: SignalResult) -> bool:
         "title": f"**{sym}**  —  {_direction_header(result)}",
         "color": color,
         "fields": fields,
-        "footer": {"text": f"CryptoSignalBot v2  ·  {now_str}"},
+        "footer": {"text": "CryptoSignalBot v2"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     ok = _post({"embeds": [embed]})
@@ -198,7 +199,7 @@ def send_startup_message(valid_symbols: list[str], skipped: list[str]) -> bool:
     embed = {
         "description": desc,
         "color": COLOR_STARTUP,
-        "footer": {"text": f"CryptoSignalBot v2  ·  {datetime.now(timezone.utc).strftime('今天%H:%M')}"},
+        "footer": {"text": "CryptoSignalBot v2"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     return _post({"embeds": [embed]})
