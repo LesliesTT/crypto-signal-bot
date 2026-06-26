@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from analyzer import analyze
 from config import SCAN_INTERVAL_MINUTES, SYMBOLS
 from discord_notifier import send_signal, send_startup_message, send_summary
-from market_data import fetch_multi_tf, fetch_ticker, validate_symbol
+from market_data import fetch_multi_tf, fetch_ticker
 
 # ── 日志配置 ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -116,23 +116,11 @@ def main() -> None:
 
     logger.info("交易信号机器人 v2 启动")
     logger.info("配置：%d 个币种，最低%d星触发", len(SYMBOLS), 3)
+    logger.info("数据节点：data-api.binance.vision（无地区限制）")
 
-    # 验证并分类币种
-    valid_symbols, skipped_symbols = [], []
-    for sym in SYMBOLS:
-        ok, _ = validate_symbol(sym)
-        if ok:
-            valid_symbols.append(sym)
-        else:
-            skipped_symbols.append(sym)
-
-    if not valid_symbols:
-        logger.error("没有可用的币种，请检查配置！")
-        sys.exit(1)
-
-    logger.info("有效币种（%d）：%s", len(valid_symbols), ", ".join(valid_symbols))
-    if skipped_symbols:
-        logger.warning("已跳过不可用币种：%s", ", ".join(skipped_symbols))
+    # 不做预验证，直接启动；不可用的币种会在扫描时自动跳过
+    valid_symbols = SYMBOLS
+    skipped_symbols: list[str] = []
 
     # 发送启动通知
     send_startup_message(valid_symbols, skipped_symbols)
