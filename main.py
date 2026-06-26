@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 """
-交易信号机器人 v2 — 主程序
-支持：
-  --once   单次扫描（GitHub Actions 模式）
-  无参数   持续循环运行（本地后台模式）
+交易信号机器人 v2 — 事件驱动模式
+只在信号真正触发时推送，避免行情噪音：
+  - 新信号出现（之前是 NEUTRAL）→ 推送
+  - 信号方向反转（BUY→SELL 或反之）→ 推送
+  - 信号强度升级（星级提升≥2）→ 推送
+  - 同方向信号：4小时冷却期内不重复推送
 """
 
 import argparse
+import json
 import logging
 import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
-from analyzer import analyze
+from analyzer import SignalResult, analyze
 from config import SCAN_INTERVAL_MINUTES, SYMBOLS
-from discord_notifier import send_signal, send_startup_message, send_summary
+from discord_notifier import send_signal, send_startup_message
 from market_data import fetch_multi_tf, fetch_ticker
 
 # ── 日志配置 ─────────────────────────────────────────────────────────────────
@@ -31,60 +35,133 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── 信号状态管理 ──────────────────────────────────────────────────────────────
+STATE_FILE    = Path("signal_state.json")
+COOLDOWN_HRS  = 4   # 同方向信号冷却时间（小时）
+
+
+def _load_state() -> dict:
+    """加载上次推送状态"""
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_state(state: dict) -> None:
+    """保存当前推送状态"""
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _should_send(result: SignalResult, state: dict) -> bool:
+    """
+    判断是否需要推送信号：
+    1. 信号未达门槛（<3星 或 NEUTRAL）→ 不推送
+    2. 该币种首次出现有效信号 → 推送
+    3. 信号方向反转 → 推送
+    4. 信号星级提升 ≥2 → 推送（大幅增强）
+    5. 同方向但超过冷却期 → 推送
+    6. 其余情况 → 不推送（避免噪音）
+    """
+    if not result.should_send:
+        return False
+
+    sym  = result.symbol
+    prev = state.get(sym)
+
+    # 首次出现有效信号
+    if prev is None:
+        return True
+
+    prev_dir   = prev.get("direction", "NEUTRAL")
+    prev_stars = prev.get("stars", 0)
+
+    # 方向反转
+    if prev_dir != result.direction:
+        return True
+
+    # 信号大幅增强（星级+2）
+    if result.stars >= prev_stars + 2:
+        return True
+
+    # 冷却期检查
+    sent_at_str = prev.get("sent_at", "")
+    if sent_at_str:
+        try:
+            sent_at = datetime.fromisoformat(sent_at_str)
+            hours_elapsed = (datetime.now(timezone.utc) - sent_at).total_seconds() / 3600
+            if hours_elapsed >= COOLDOWN_HRS:
+                return True
+        except Exception:
+            return True
+
+    # 同方向 + 冷却期内 → 不重复推送
+    return False
+
+
+def _update_state(state: dict, result: SignalResult) -> None:
+    state[result.symbol] = {
+        "direction": result.direction,
+        "stars":     result.stars,
+        "sent_at":   datetime.now(timezone.utc).isoformat(),
+    }
+
 
 # ── 核心扫描函数 ──────────────────────────────────────────────────────────────
 
-def scan_market() -> None:
-    """扫描所有配置的币种，分析信号并推送到 Discord"""
+def scan_market(state: dict) -> dict:
+    """
+    扫描所有币种，只在条件触发时推送信号。
+    返回更新后的 state。
+    """
     scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     logger.info("═" * 55)
-    logger.info("开始市场扫描  %s", scan_time)
+    logger.info("开始静默扫描  %s", scan_time)
     logger.info("═" * 55)
 
-    results = []
+    sent_count = 0
+
     for symbol in SYMBOLS:
         try:
             logger.info("分析 %s ...", symbol)
 
-            # 拉取多时间框架数据（同时验证币种可用性）
             tf_data = fetch_multi_tf(symbol)
             if tf_data is None:
                 logger.warning("⚠️  %s 数据不可用，跳过", symbol)
                 continue
 
-            # 拉取 24h ticker
             ticker = fetch_ticker(symbol)
             if ticker is None:
                 logger.warning("⚠️  %s ticker 获取失败，跳过", symbol)
                 continue
 
-            # 综合分析
             result = analyze(symbol, tf_data, ticker)
-            results.append(result)
+
+            status = "—"
+            if result.should_send:
+                if _should_send(result, state):
+                    status = "🔔 推送"
+                    send_signal(result)
+                    _update_state(state, result)
+                    sent_count += 1
+                    time.sleep(0.5)
+                else:
+                    status = "🔇 冷却中（同方向已推送）"
+            else:
+                status = f"静默（{result.stars}星 未达门槛）"
 
             logger.info(
-                "  %s → %s  %d星  价格=%s  信号=%s",
-                symbol,
-                result.direction,
-                result.stars,
-                result.price,
-                "触发" if result.should_send else "未达门槛",
+                "  %s → %s %d星  %s",
+                symbol, result.direction, result.stars, status,
             )
 
-            # 达到门槛才推送单独信号卡
-            if result.should_send:
-                send_signal(result)
-                time.sleep(0.5)   # 避免频率限制
-
         except Exception as exc:
-            logger.error("分析 %s 时出现异常: %s", symbol, exc, exc_info=True)
+            logger.error("分析 %s 时异常: %s", symbol, exc, exc_info=True)
 
-    # 汇总推送
-    if results:
-        send_summary(results, scan_time)
-
-    triggered_count = sum(1 for r in results if r.should_send)
-    logger.info("扫描完成：%d/%d 个币种触发信号（≥3星）", triggered_count, len(results))
+    logger.info("扫描完成：本轮推送 %d 个信号", sent_count)
+    return state
 
 
 # ── 调度器 ────────────────────────────────────────────────────────────────────
@@ -94,9 +171,11 @@ _stop_event = threading.Event()
 
 def _scheduler_loop() -> None:
     interval = SCAN_INTERVAL_MINUTES * 60
+    state = _load_state()
     while not _stop_event.is_set():
         try:
-            scan_market()
+            state = scan_market(state)
+            _save_state(state)
         except Exception as exc:
             logger.error("扫描异常: %s", exc, exc_info=True)
         logger.info("下次扫描将在 %d 分钟后进行...", SCAN_INTERVAL_MINUTES)
@@ -106,40 +185,30 @@ def _scheduler_loop() -> None:
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="加密货币交易信号机器人 v2")
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="只运行一次扫描（用于 GitHub Actions）",
-    )
+    parser = argparse.ArgumentParser(description="加密货币交易信号机器人 v2（事件驱动）")
+    parser.add_argument("--once", action="store_true", help="单次扫描（GitHub Actions 模式）")
     args = parser.parse_args()
 
-    logger.info("交易信号机器人 v2 启动")
-    logger.info("配置：%d 个币种，最低%d星触发", len(SYMBOLS), 3)
-    logger.info("数据节点：data-api.binance.vision（无地区限制）")
+    logger.info("交易信号机器人 v2 启动（事件驱动模式）")
+    logger.info("推送规则：新信号/方向反转/升级≥2星 → 推送；同方向冷却 %dh", COOLDOWN_HRS)
 
-    # 不做预验证，直接启动；不可用的币种会在扫描时自动跳过
-    valid_symbols = SYMBOLS
-    skipped_symbols: list[str] = []
-
-    # 发送启动通知
-    send_startup_message(valid_symbols, skipped_symbols)
+    send_startup_message(SYMBOLS, [])
 
     if args.once:
-        # GitHub Actions 模式：单次扫描
-        scan_market()
+        state = _load_state()
+        state = scan_market(state)
+        _save_state(state)
     else:
-        # 本地持续运行模式
         thread = threading.Thread(target=_scheduler_loop, daemon=True)
         thread.start()
         try:
             while thread.is_alive():
                 thread.join(timeout=1)
         except KeyboardInterrupt:
-            logger.info("接收到中断信号，正在停止...")
+            logger.info("正在停止...")
             _stop_event.set()
             thread.join(timeout=5)
-            logger.info("机器人已停止。")
+            logger.info("已停止。")
 
 
 if __name__ == "__main__":

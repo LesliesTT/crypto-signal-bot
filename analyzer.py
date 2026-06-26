@@ -65,6 +65,13 @@ class SignalResult:
     atr: float = 0.0
     rr_ratio: str = ""
     should_send: bool = False  # 是否达到最低星级门槛
+    # 入场建议
+    entry_price: float = 0.0
+    entry_zone_low: float = 0.0
+    entry_zone_high: float = 0.0
+    # 触发信号的 OB / FVG 具体位置（只含与信号方向一致的）
+    signal_obs: list[dict] = field(default_factory=list)   # [{'high':x,'low':y}, ...]
+    signal_fvgs: list[dict] = field(default_factory=list)  # [{'upper':x,'lower':y}, ...]
 
 
 # ─── 基础指标计算 ─────────────────────────────────────────────────────────────
@@ -238,10 +245,68 @@ def _price_near_ob(price: float, obs: list, tolerance: float = 0.015) -> bool:
         mid = (ob["high"] + ob["low"]) / 2
         if abs(price - mid) / mid <= tolerance:
             return True
-        # 也检查是否在 OB 范围内
         if ob["low"] * (1 - tolerance) <= price <= ob["high"] * (1 + tolerance):
             return True
     return False
+
+
+def _get_near_obs(price: float, obs: list, tolerance: float = 0.015) -> list[dict]:
+    """返回价格附近（±1.5%）所有 OB，按距离排序"""
+    matched = []
+    for ob in obs:
+        mid = (ob["high"] + ob["low"]) / 2
+        dist = abs(price - mid) / mid
+        in_range = ob["low"] * (1 - tolerance) <= price <= ob["high"] * (1 + tolerance)
+        if dist <= tolerance or in_range:
+            matched.append({**ob, "_dist": dist})
+    matched.sort(key=lambda x: x["_dist"])
+    return [{k: v for k, v in ob.items() if k != "_dist"} for ob in matched]
+
+
+def _get_active_fvgs(price: float, fvgs: list) -> list[dict]:
+    """返回价格所在或紧贴（±0.5%）的 FVG 列表（最近5个内）"""
+    tol = 0.005
+    result = []
+    for fvg in fvgs[-5:]:
+        lo = fvg["lower"] * (1 - tol)
+        hi = fvg["upper"] * (1 + tol)
+        if lo <= price <= hi:
+            result.append(fvg)
+    return result
+
+
+def _calc_entry(
+    price: float,
+    direction: str,
+    obs: list[dict],
+    fvgs: list[dict],
+) -> tuple[float, float, float]:
+    """
+    计算建议入场价和入场区间 (entry_price, zone_low, zone_high)。
+    BUY:  以最近看涨OB顶部 / FVG上边界为入场参考，区间为OB/FVG范围
+    SELL: 以最近看跌OB底部 / FVG下边界为入场参考
+    """
+    if direction == "BUY":
+        if obs:
+            ob = obs[0]
+            return ob["high"], ob["low"], ob["high"]
+        if fvgs:
+            fvg = fvgs[0]
+            mid = (fvg["upper"] + fvg["lower"]) / 2
+            return mid, fvg["lower"], fvg["upper"]
+        return price, price * 0.999, price * 1.001
+
+    if direction == "SELL":
+        if obs:
+            ob = obs[0]
+            return ob["low"], ob["low"], ob["high"]
+        if fvgs:
+            fvg = fvgs[0]
+            mid = (fvg["upper"] + fvg["lower"]) / 2
+            return mid, fvg["lower"], fvg["upper"]
+        return price, price * 0.999, price * 1.001
+
+    return price, price, price
 
 
 # ─── ICT：Fair Value Gaps ─────────────────────────────────────────────────────
@@ -456,8 +521,10 @@ def analyze(
 
     # ── ICT Order Blocks（用1H）──────────────────────────────────────────────
     bull_obs, bear_obs = _find_order_blocks(df_1h, ORDER_BLOCK_LOOKBACK)
-    at_bull_ob = _price_near_ob(price, bull_obs)
-    at_bear_ob = _price_near_ob(price, bear_obs)
+    near_bull_obs = _get_near_obs(price, bull_obs)
+    near_bear_obs = _get_near_obs(price, bear_obs)
+    at_bull_ob = len(near_bull_obs) > 0
+    at_bear_ob = len(near_bear_obs) > 0
     if at_bull_ob:
         buy_score += 2
         triggered.append(f"✅ ICT 看涨订单块支撑（共 {len(bull_obs)} 个有效OB）")
@@ -467,10 +534,12 @@ def analyze(
 
     # ── ICT Fair Value Gaps（用1H）───────────────────────────────────────────
     bull_fvg, bear_fvg = _find_fvg(df_1h, FVG_LOOKBACK)
-    if _price_in_fvg(price, bull_fvg):
+    active_bull_fvgs = _get_active_fvgs(price, bull_fvg)
+    active_bear_fvgs = _get_active_fvgs(price, bear_fvg)
+    if active_bull_fvgs:
         buy_score += 1
         triggered.append("✅ ICT 看涨FVG（价值缺口支撑）")
-    if _price_in_fvg(price, bear_fvg):
+    if active_bear_fvgs:
         sell_score += 1
         triggered.append("✅ ICT 看跌FVG（价值缺口阻力）")
 
@@ -581,6 +650,19 @@ def analyze(
 
     should_send = stars >= MIN_STAR_RATING and direction != "NEUTRAL"
 
+    # ── 入场点位 & 有效 OB/FVG 位置 ──────────────────────────────────────────
+    if direction == "BUY":
+        signal_obs  = near_bull_obs[:3]
+        signal_fvgs = active_bull_fvgs[:2]
+    elif direction == "SELL":
+        signal_obs  = near_bear_obs[:3]
+        signal_fvgs = active_bear_fvgs[:2]
+    else:
+        signal_obs  = []
+        signal_fvgs = []
+
+    entry_price, zone_low, zone_high = _calc_entry(price, direction, signal_obs, signal_fvgs)
+
     return SignalResult(
         symbol=symbol,
         direction=direction,
@@ -597,4 +679,9 @@ def analyze(
         atr=atr_val,
         rr_ratio=rr,
         should_send=should_send,
+        entry_price=entry_price,
+        entry_zone_low=zone_low,
+        entry_zone_high=zone_high,
+        signal_obs=signal_obs,
+        signal_fvgs=signal_fvgs,
     )
