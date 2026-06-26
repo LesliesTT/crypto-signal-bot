@@ -1,0 +1,9 @@
+version: "3.9"
+services:
+  signal-bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+    volumes:
+      - ./signal_bot.log:/app/signal_bot.log
